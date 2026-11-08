@@ -22,6 +22,7 @@ Everything under "SERVER PLUMBING" talks to the judge. You normally never
 need to change it, and if you break it the judge can't talk to your bot.
 """
 
+import json
 import os
 import random
 import time
@@ -46,7 +47,12 @@ AGENT_NAME = "outliers-bot"
 
 
 # ===== YOUR CODE HERE =====
-# Strategy v1: preflop hand-strength heuristic + Monte Carlo equity after the flop.
+# Strategy v2:
+#   * preflop: precomputed equity table (preflop_equity.json) for all 19,998 hand types
+#   * postflop: Monte Carlo equity against the opponent's likely RANGE, built from how
+#     they bet this hand and what they showed down earlier (rejection sampling)
+#   * opponent model per half: aggression, fold-to-bet, bluff rate -> adjusts calling,
+#     value-betting and bluffing
 
 from itertools import combinations as _comb
 
@@ -54,151 +60,519 @@ _TABLE = get_table()
 _PAIRS = tuple(_comb(range(5), 2))
 _TRIPLES = tuple(_comb(range(5), 3))
 _DECK = tuple(range(36))
+_RCH = "6789TJQKA"
+_SHIFT = 20  # score >> 20 = hand category (0 high card .. 8 straight flush)
 
-TIME_SOFT_LIMIT = 5.0      # seconds of our own thinking per half before we cut down simulations
-SIM_BUDGET = 0.0012        # seconds of simulation per decision (normal)
-SIM_BUDGET_LOW = 0.0004    # seconds of simulation per decision once we are past the soft limit
+_HERE = os.path.dirname(os.path.abspath(__file__))
+try:
+    with open(os.path.join(_HERE, "preflop_equity.json")) as _f:
+        _PREFLOP = json.load(_f)
+except Exception:
+    _PREFLOP = {}
+
+P = {
+    "time_target": 3.0,      # seconds of thinking per half we plan to use (bank is 8 s)
+    "time_hard": 5.0,
+    "overhead": 0.00012,
+    "budget": 0.0015,        # max seconds of simulation per decision
+    "budget_min": 0.0002,
+    # preflop equity thresholds (vs a random hand)
+    "pf_open_pot": 0.585,
+    "pf_open_half": 0.545,
+    "pf_limp": 0.47,
+    "pf_3bet": 0.60,
+    "pf_4bet": 0.635,
+    "pf_call_margin": 0.0,
+    # postflop
+    "val_pot": 0.72,
+    "val_half": 0.60,
+    "raise_vs_bet": 0.70,
+    "cm1": 0.08,
+    "cm2": 0.06,
+    "cm3": 0.03,
+    "range_on": 1.0,
+    "prior_w": 6.0,          # pseudo-count weight of the postflop range priors
+    "prior_w_pf": 8.0,
+    "prev_exp": 0.3,         # evidence from earlier streets counts less
+    "ref_n": 24,
+    "learn_ref_n": 25,
+    "bluff_freq": 0.30,
+}
 
 
-def _best(hole_masks, board):
-    """Best Omaha score for precomputed 2-card hole masks and a 5-card board."""
-    b = [1 << c for c in board]
-    bms = [b[i] | b[j] | b[k] for i, j, k in _TRIPLES]
-    t = _TABLE
-    return max(t[h | bm] for h in hole_masks for bm in bms)
-
+# ---------- card helpers ----------
 
 def _hole_masks(hole):
     h = [1 << c for c in hole]
     return [h[i] | h[j] for i, j in _PAIRS]
 
 
-def preflop_strength(hole) -> float:
-    """Rough 0..~12 score of 5 hole cards. Higher is better."""
+def _best(hole_masks, board):
+    """Best Omaha score with a full 5-card board."""
+    b = [1 << c for c in board]
+    t = _TABLE
+    bms = [b[i] | b[j] | b[k] for i, j, k in _TRIPLES]
+    return max(t[h | bm] for h in hole_masks for bm in bms)
+
+
+_TRIPLES_BY_LEN = {n: tuple(_comb(range(n), 3)) for n in (3, 4, 5)}
+
+
+def _made(hole_masks, board):
+    """Best Omaha score on a partial board (3 or 4 cards): 2 hole + 3 board."""
+    b = [1 << c for c in board]
+    t = _TABLE
+    bms = [b[i] | b[j] | b[k] for i, j, k in _TRIPLES_BY_LEN[len(board)]]
+    return max(t[h | bm] for h in hole_masks for bm in bms)
+
+
+def preflop_key(hole) -> str:
+    g = {}
+    for c in hole:
+        g.setdefault(c & 3, []).append(c >> 2)
+    groups = sorted((tuple(sorted(v, reverse=True)) for v in g.values()),
+                    key=lambda t: (-len(t), [-x for x in t]))
+    return "|".join("".join(_RCH[r] for r in grp) for grp in groups)
+
+
+def preflop_equity(hole) -> float:
+    e = _PREFLOP.get(preflop_key(hole))
+    if e is not None:
+        return e
+    # fallback (table missing): crude heuristic mapped to ~0.4..0.65
     ranks = [c >> 2 for c in hole]
-    suits = [c & 3 for c in hole]
-    s = 0.0
-    # pairs (count 2) are good, trips/quads waste cards
-    for r in set(ranks):
-        n = ranks.count(r)
-        if n == 2:
-            s += 1.5 + r / 4.0
-        elif n >= 3:
-            s += 0.5 + r / 8.0
-    # suitedness: 2-3 of a suit is great, 4+ less so; ace/king of that suit is a bonus
-    for su in set(suits):
-        n = suits.count(su)
-        if n >= 2:
-            top = max(c >> 2 for c in hole if (c & 3) == su)
-            s += (1.5 if n <= 3 else 0.7) + (0.8 if top == 8 else 0.4 if top == 7 else 0.0)
-    # connectedness of distinct ranks
-    d = sorted(set(ranks))
-    for a, b in zip(d, d[1:]):
-        gap = b - a
-        if gap == 1:
-            s += 0.8
-        elif gap == 2:
-            s += 0.4
-    # high cards
-    s += sum(ranks) / 10.0
+    return 0.40 + sum(ranks) / 160.0
+
+
+# ---------- preflop percentile of every 5-card hand ----------
+
+_NB_PF = 10   # preflop strength bins (deciles vs random hands)
+_NB = 5       # postflop strength bins (quintiles vs random hands on this board)
+_FD_SCORE = 2 << _SHIFT   # a flush draw counts like a weak two pair
+
+
+def _build_pf_bins():
+    if not _PREFLOP:
+        return {}
+    from bisect import bisect_right
+    by_key = {}
+    eq = {}
+    for c in _comb(range(36), 5):
+        k = preflop_key(c)
+        e = _PREFLOP.get(k, 0.5)
+        eq[(1 << c[0]) | (1 << c[1]) | (1 << c[2]) | (1 << c[3]) | (1 << c[4])] = e
+    vals = sorted(eq.values())
+    n = len(vals)
+    cuts = [vals[n * k // _NB_PF] for k in range(1, _NB_PF)]
+    for e in set(vals):
+        by_key[e] = bisect_right(cuts, e)
+    return {m: by_key[e] for m, e in eq.items()}
+
+
+try:
+    _PF_BIN = _build_pf_bins()
+except Exception:
+    _PF_BIN = {}
+
+
+# ---------- opponent model ----------
+
+# Prior shapes (relative weights per strength bin, weakest first) for the hands an
+# opponent shows down after each kind of action. Learned per half from showdowns.
+_PRIOR = {
+    "pfr": [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4],
+    "pfc": [0.8, 0.85, 0.9, 0.95, 1.0, 1.0, 1.0, 1.05, 1.05, 1.1],
+    "bet": [0.55, 0.6, 0.8, 1.0, 1.2],
+    "call": [0.7, 0.85, 1.0, 1.05, 1.1],
+    "check": [1.2, 1.15, 1.0, 0.85, 0.7],
+}
+_TYPES = {2: "bet", 1: "call", 0: "check"}
+
+
+def _opp(memory):
+    return memory["opp"]
+
+
+def _rate(num, den, prior, weight):
+    return (num + prior * weight) / (den + weight)
+
+
+def opp_stats(memory):
+    o = _opp(memory)
+    return {
+        "pf_raise": _rate(o["pf_raise"], o["pf_dec"], 0.35, 20),
+        "agg": _rate(o["post_raise"], o["post_dec"], 0.35, 20),
+        "fold_to_bet": _rate(o["fold_to_bet"], o["faced_bet"], 0.40, 15),
+    }
+
+
+def _new_hists():
+    out = {}
+    for k, v in _PRIOR.items():
+        tot = sum(v)
+        w = P["prior_w_pf"] if k.startswith("pf") else P["prior_w"]
+        out[k] = [x * w / tot for x in v]
+    return out
+
+
+def _acc_table(h):
+    m = max(h)
+    return [x / m for x in h]
+
+
+def _track_actions(obs: Observation, memory: dict):
+    """Count opponent actions we have not seen yet in this hand and keep the
+    opponent's line: per street 2 = bet/raise, 1 = call, 0 = check."""
+    o = _opp(memory)
+    if memory.get("cur_hand") != obs.hand_index:
+        memory["cur_hand"] = obs.hand_index
+        memory["seen"] = 0
+        memory["hand_aggr"] = 0      # opponent bets/raises after the flop this hand
+        memory["last_mine"] = None
+        memory["line"] = {}
+        memory["hole"] = tuple(obs.hole_cards)
+    line = memory["line"]
+    hist = obs.action_history
+    for a in hist[memory["seen"]:]:
+        if a.is_me:
+            continue
+        raised = a.action in (Action.RAISE_HALF, Action.RAISE_POT)
+        lv = 2 if raised else (1 if (a.action == Action.CHECK_CALL and a.amount > 0) else 0)
+        st = int(a.street)
+        if a.action != Action.FOLD:
+            line[st] = max(line.get(st, 0), lv)
+        if a.street == Street.PREFLOP:
+            o["pf_dec"] += 1
+            o["pf_raise"] += raised
+        else:
+            o["post_dec"] += 1
+            o["post_raise"] += raised
+            if raised:
+                memory["hand_aggr"] += 1
+    memory["seen"] = len(hist)
+
+
+def _strength(om, cards5, board, fds):
+    """Opponent hand strength on a partial or full board; flush draws count as
+    weak two pair on the flop and turn."""
+    s = _made(om, board) if len(board) < 5 else _best(om, board)
+    if fds and s < _FD_SCORE:
+        for su in fds:
+            k = 0
+            for c in cards5:
+                if c & 3 == su:
+                    k += 1
+            if k >= 2:
+                return _FD_SCORE
     return s
 
 
-def equity(obs: Observation, budget: float) -> float:
-    """Monte Carlo win probability vs. a random opponent hand (ties count half)."""
+def _flush_draw_suits(board):
+    if len(board) >= 5:
+        return ()
+    cnt = [0, 0, 0, 0]
+    for c in board:
+        cnt[c & 3] += 1
+    return tuple(su for su in range(4) if cnt[su] == 2)
+
+
+def _pct_bin(ref, s, nb):
+    from bisect import bisect_left, bisect_right
+    k = len(ref)
+    p = (bisect_left(ref, s) + bisect_right(ref, s)) / (2.0 * k)
+    b = int(p * nb)
+    return b if b < nb else nb - 1
+
+
+# ---------- equity vs. range ----------
+
+def _range_tables(obs: Observation, memory: dict):
+    """Acceptance tables (per strength bin) from the opponent's line this hand."""
+    hists = memory["hists"]
+    line = memory.get("line", {})
+    pf = None
+    lv = line.get(0)
+    if lv == 2:
+        pf = _acc_table(hists["pfr"])
+    elif lv == 1:
+        pf = _acc_table(hists["pfc"])
+    post = None
+    cur = int(obs.street)
+    for st in range(1, cur + 1):
+        if st not in line:
+            continue
+        t = _acc_table(hists[_TYPES[line[st]]])
+        if st < cur:
+            t = [x ** P["prev_exp"] for x in t]
+        post = t if post is None else [a * b for a, b in zip(post, t)]
+    return pf, post
+
+
+def equity_vs_range(obs: Observation, memory: dict, budget: float) -> float:
     hole = obs.hole_cards
     board = list(obs.board)
     used = set(hole) | set(board)
     rest = [c for c in _DECK if c not in used]
     need = 5 - len(board)
-    my_masks = _hole_masks(hole)
+    mine_m = _hole_masks(hole)
+    if P["range_on"] > 0:
+        pf_t, post_t = _range_tables(obs, memory)
+    else:
+        pf_t = post_t = None
+    if not _PF_BIN:
+        pf_t = None
+    fds = _flush_draw_suits(board)
     rnd = random.random
     sample = random.sample
+    pfb = _PF_BIN
     deadline = time.perf_counter() + budget
+    fixed_mine = _best(mine_m, board) if need == 0 else None
+    min_n = 8 if budget <= 0 else (25 if budget >= 0.0006 else 14)
+    # reference strengths (random opponent hands) for percentiles on this board
+    ref = None
+    queue = []
+    if post_t is not None:
+        for _ in range(int(P["ref_n"])):
+            cards = sample(rest, 5 + need)
+            om = _hole_masks(cards[:5])
+            queue.append((cards, om, _strength(om, cards[:5], board, fds)))
+        ref = sorted(q[2] for q in queue)
     wins = 0.0
     n = 0
-    fixed_mine = _best(my_masks, board) if need == 0 else None
+    tries = 0
+    qi = 0
+    hard = deadline + budget
+    force = False
     while True:
-        cards = sample(rest, 5 + need)
-        opp = cards[:5]
-        full = board + cards[5:] if need else board
-        mine = fixed_mine if fixed_mine is not None else _best(my_masks, full)
-        theirs = _best(_hole_masks(opp), full)
+        tries += 1
+        if qi < len(queue):
+            cards, om, s = queue[qi]
+            qi += 1
+            if not force:
+                w = 1.0
+                if pf_t is not None:
+                    w = pf_t[pfb.get(om[0] | om[1] | om[9], 5)]
+                w *= post_t[_pct_bin(ref, s, _NB)]
+                if w < 1.0 and rnd() > w:
+                    continue
+        else:
+            cards = sample(rest, 5 + need)
+            om = _hole_masks(cards[:5])
+            s = None
+            if not force:
+                if pf_t is not None:
+                    w = pf_t[pfb.get(om[0] | om[1] | om[9], 5)]
+                    if w < 1.0 and rnd() > w:
+                        if tries & 31 == 0 and time.perf_counter() > hard:
+                            force = True
+                        continue
+                if ref is not None:
+                    s = _strength(om, cards[:5], board, fds)
+                    w = post_t[_pct_bin(ref, s, _NB)]
+                    if w < 1.0 and rnd() > w:
+                        if tries & 31 == 0 and time.perf_counter() > hard:
+                            force = True
+                        continue
+            if tries > 3000:
+                force = True
+        if need:
+            full = board + cards[5:]
+            mine = _best(mine_m, full)
+            theirs = _best(om, full)
+        else:
+            mine = fixed_mine
+            theirs = s if s is not None else _best(om, board)
         if mine > theirs:
             wins += 1.0
         elif mine == theirs:
             wins += 0.5
         n += 1
-        if n >= 400 or (n >= 20 and time.perf_counter() > deadline):
+        if n >= 500 or (n >= min_n and time.perf_counter() > deadline):
             break
     return wins / n
 
 
-def _raise(obs: Observation, prefer: Action) -> Action:
-    if prefer in obs.legal_actions:
-        return prefer
-    for a in (Action.RAISE_POT, Action.RAISE_HALF):
+# ---------- decisions ----------
+
+def _pick(obs, *prefs):
+    for a in prefs:
         if a in obs.legal_actions:
             return a
     return Action.CHECK_CALL
 
 
-def _decide(obs: Observation, memory: dict) -> Action:
-    legal = obs.legal_actions
-    can_raise = Action.RAISE_POT in legal or Action.RAISE_HALF in legal
+def _preflop(obs: Observation, memory: dict) -> Action:
+    e = preflop_equity(obs.hole_cards)
+    st = opp_stats(memory)
     to_call = obs.to_call
-    pot_odds = to_call / (obs.pot + to_call) if to_call > 0 else 0.0
-
-    if obs.street == Street.PREFLOP:
-        s = preflop_strength(obs.hole_cards)
-        if s >= 7.5 and can_raise and obs.raises_this_street < 3:
-            return _raise(obs, Action.RAISE_POT)
-        if s >= 5.5 and can_raise and obs.raises_this_street < 1:
-            return _raise(obs, Action.RAISE_HALF)
-        if to_call == 0:
-            return Action.CHECK_CALL
-        if s >= 5.0:
-            return Action.CHECK_CALL
-        if s >= 3.5 and to_call <= obs.big_blind:
-            return Action.CHECK_CALL
-        return Action.FOLD
-
-    budget = SIM_BUDGET if memory.get("think", 0.0) < TIME_SOFT_LIMIT else SIM_BUDGET_LOW
-    eq = equity(obs, budget)
-    # equity is measured vs. a random hand; a raising opponent is usually stronger
-    if to_call > 0 and obs.raises_this_street > 0:
-        eq -= 0.05 * min(obs.raises_this_street, 3)
-
-    if eq >= 0.80 and can_raise:
-        return _raise(obs, Action.RAISE_POT)
-    if eq >= 0.65 and can_raise and obs.raises_this_street < 2:
-        return _raise(obs, Action.RAISE_HALF)
-    if to_call == 0:
+    r = obs.raises_this_street
+    can_raise = Action.RAISE_POT in obs.legal_actions
+    # a wide-raising opponent has a weaker range: loosen up against them
+    loosen = max(-0.02, min(0.04, (st["pf_raise"] - 0.35) * 0.12))
+    if r == 0:
+        if to_call > 0:          # we are the button, first to act
+            if e >= P["pf_open_pot"] and can_raise:
+                return Action.RAISE_POT
+            if e >= P["pf_open_half"] and can_raise:
+                return _pick(obs, Action.RAISE_HALF, Action.RAISE_POT)
+            if e >= P["pf_limp"] - loosen:
+                return Action.CHECK_CALL
+            return Action.FOLD
+        # big blind, opponent limped
+        if e >= P["pf_open_half"] + 0.01 and can_raise:
+            return _pick(obs, Action.RAISE_POT)
         return Action.CHECK_CALL
-    if eq >= pot_odds + 0.05:
+    # facing a raise
+    pot_odds = to_call / (obs.pot + to_call)
+    if r == 1 and e >= P["pf_3bet"] - loosen and can_raise:
+        return Action.RAISE_POT
+    if r >= 2 and e >= P["pf_4bet"] - loosen and can_raise:
+        return Action.RAISE_POT
+    # preflop equity vs random overstates our edge vs a raiser; ask for a bit more
+    need = pot_odds + 0.06 + 0.02 * (r - 1) - loosen + P["pf_call_margin"]
+    if e >= need or to_call == 0:
+        return Action.CHECK_CALL
+    return Action.FOLD
+
+
+def _budget(obs: Observation, memory: dict) -> float:
+    """Simulation time for this decision: spread what is left of our target
+    thinking time over the postflop decisions we still expect this half."""
+    think = memory.get("think", 0.0)
+    if think > P["time_hard"] * memory.get("bank", 8.0) / 8.0:
+        return 0.0
+    hands_left = max(1, memory.get("n_hands", 1000) - obs.hand_index)
+    rate = (memory.get("post_n", 0) + 3.0) / (obs.hand_index + 2.0)   # postflop decisions per hand
+    post_n = memory.get("post_n", 0)
+    # measured non-simulation cost per postflop decision (preflop, bookkeeping, overruns)
+    over = (think - memory.get("sim", 0.0) + 0.003) / (post_n + 3.0)
+    per = (P["time_target"] * memory.get("bank", 8.0) / 8.0 - think) / (hands_left * rate) - max(P["overhead"], over)
+    return max(P["budget_min"], min(P["budget"], per))
+
+
+def _postflop(obs: Observation, memory: dict) -> Action:
+    st = opp_stats(memory)
+    budget = _budget(obs, memory)
+    t0 = time.perf_counter()
+    e = equity_vs_range(obs, memory, budget)
+    memory["sim"] = memory.get("sim", 0.0) + min(time.perf_counter() - t0, budget)
+    to_call = obs.to_call
+    can_raise = Action.RAISE_POT in obs.legal_actions
+    street = int(obs.street)
+    if to_call == 0:
+        # value-bet thinner against opponents who rarely fold
+        shift = (st["fold_to_bet"] - 0.4) * 0.15
+        if e >= P["val_pot"] + shift and can_raise:
+            return Action.RAISE_POT
+        if e >= P["val_half"] + shift and can_raise:
+            return Action.RAISE_HALF
+        # bluff / semi-bluff against opponents who fold too much
+        if can_raise and street < 3 and st["fold_to_bet"] > 0.45 and e >= 0.30:
+            if random.random() < P["bluff_freq"] * (st["fold_to_bet"] - 0.35) * 2.5:
+                return Action.RAISE_HALF
+        if can_raise and street == 3 and st["fold_to_bet"] > 0.55 and e < 0.25:
+            if random.random() < P["bluff_freq"] * (st["fold_to_bet"] - 0.45) * 2.0:
+                return Action.RAISE_POT
+        return Action.CHECK_CALL
+    pot_odds = to_call / (obs.pot + to_call)
+    if e >= P["raise_vs_bet"] and can_raise and obs.raises_this_street < 3:
+        return Action.RAISE_POT
+    margin = P["cm%d" % street]
+    if e >= pot_odds + margin:
         return Action.CHECK_CALL
     return Action.FOLD
 
 
 def new_half(config: AgentConfig, memory: dict) -> None:
-    memory["hands_played"] = 0
-    memory["think"] = 0.0     # seconds spent inside choose_action this half
+    memory["think"] = 0.0
+    memory["post_n"] = 0
+    memory["n_hands"] = 1000
+    memory["bank"] = 8.0
+    if config is not None:
+        try:
+            memory["n_hands"] = max(1, int(config.num_hands))
+            memory["bank"] = float(config.time_bank_seconds)
+        except Exception:
+            pass
+    memory["opp"] = {"pf_dec": 0, "pf_raise": 0, "post_dec": 0, "post_raise": 0,
+                     "faced_bet": 0, "fold_to_bet": 0, "sd_aggr": 0, "sd_weak_aggr": 0}
+    memory["cur_hand"] = None
+    memory["hists"] = _new_hists()
 
 
 def choose_action(obs: Observation, memory: dict) -> Action:
     start = time.perf_counter()
+    action = Action.CHECK_CALL
     try:
-        action = _decide(obs, memory)
+        if "opp" not in memory:
+            new_half(None, memory)
+        _track_actions(obs, memory)
+        if obs.street == Street.PREFLOP:
+            action = _preflop(obs, memory)
+        else:
+            memory["post_n"] = memory.get("post_n", 0) + 1
+            action = _postflop(obs, memory)
         if action not in obs.legal_actions:
             action = Action.CHECK_CALL
+        memory["last_mine"] = (action, int(obs.street))
     except Exception:
-        action = Action.CHECK_CALL   # never crash: CHECK_CALL is always legal
+        action = Action.CHECK_CALL
     memory["think"] = memory.get("think", 0.0) + (time.perf_counter() - start)
     return action
 
 
+def _learn_showdown(result: HandResult, memory: dict):
+    line = memory.get("line", {})
+    hists = memory["hists"]
+    opp = tuple(result.opp_hole)
+    om = _hole_masks(opp)
+    lv = line.get(0)
+    if lv in (1, 2) and _PF_BIN:
+        b = _PF_BIN.get(om[0] | om[1] | om[9])
+        if b is not None:
+            hists["pfr" if lv == 2 else "pfc"][b] += 1
+    full = list(result.board)
+    if len(full) < 5:
+        return
+    known = set(opp) | set(full) | set(memory.get("hole", ()))
+    rest = [c for c in _DECK if c not in known]
+    sample = random.sample
+    last = memory.get("last_mine")
+    max_st = max(list(line.keys()) + [last[1] if last else 0])
+    for st in range(1, min(3, max_st) + 1):
+        board = full[:2 + st]
+        fds = _flush_draw_suits(board)
+        ref = []
+        for _ in range(int(P["learn_ref_n"])):
+            cards = sample(rest, 5)
+            ref.append(_strength(_hole_masks(cards), cards, board, fds))
+        ref.sort()
+        b = _pct_bin(ref, _strength(om, opp, board, fds), _NB)
+        hists[_TYPES[line.get(st, 0)]][b] += 1
+
+
 def on_hand_end(result: HandResult, memory: dict) -> None:
-    memory["hands_played"] = memory.get("hands_played", 0) + 1
+    start = time.perf_counter()
+    try:
+        if "opp" not in memory:
+            return
+        o = memory["opp"]
+        if memory.get("cur_hand") != result.hand_index:
+            return  # we never acted in this hand
+        last = memory.get("last_mine")
+        if last and last[0] in (Action.RAISE_HALF, Action.RAISE_POT) and last[1] >= 1:
+            o["faced_bet"] += 1
+            if not result.went_to_showdown and result.winner == "me":
+                o["fold_to_bet"] += 1
+        if result.went_to_showdown and result.opp_hole:
+            line = memory.setdefault("line", {})
+            if last and last[0] in (Action.RAISE_HALF, Action.RAISE_POT):
+                line[last[1]] = max(line.get(last[1], 0), 1)   # they called our last bet
+            _learn_showdown(result, memory)
+    except Exception:
+        pass
+    finally:
+        memory["think"] = memory.get("think", 0.0) + (time.perf_counter() - start)
 
 # ===== END OF YOUR CODE =====
 
