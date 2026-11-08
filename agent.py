@@ -101,6 +101,8 @@ P = {
     "cm_rr": 0.0,
     "ftb_fix": 0.0,
     "sb_e": 0.30,
+    "bluff_gate": 0.0,
+    "call_gate": 0.5,
     "sb_pot": 0.0,
     "rb_e": 0.25,
     "rb_k": 4.0,
@@ -389,6 +391,8 @@ def opp_stats(memory):
         "pf_raise": _rate(o["pf_raise"], o["pf_dec"], 0.35, 20),
         "agg": _rate(o["post_raise"], o["post_dec"], 0.35, 20),
         "fold_to_bet": _rate(o["fold_to_bet"], o["faced_bet"], 0.40, 15),
+        "call2": _rate(o.get("call2", 0), o.get("faced2", 0), 0.40, 15),
+        "ftb2": _rate(o.get("fold2", 0), o.get("faced2", 0), 0.45, 15),
         "bet_free": _rate(o.get("free_bet", 0), o.get("free_dec", 0), 0.40, 20),
     }
 
@@ -427,10 +431,14 @@ def _track_actions(obs: Observation, memory: dict):
         raised = a.action in (Action.RAISE_HALF, Action.RAISE_POT)
         lv = 2 if raised else (1 if (a.action == Action.CHECK_CALL and a.amount > 0) else 0)
         if a.street != Street.PREFLOP:
-            if P["ftb_fix"] > 0 and idx > 0:
+            if idx > 0:
                 pv = hist[idx - 1]
                 if pv.is_me and pv.street == a.street and pv.action in (Action.RAISE_HALF, Action.RAISE_POT):
-                    o["faced_bet"] += 1      # they called or raised our bet (a fold is counted at hand end)
+                    o["faced2"] = o.get("faced2", 0) + 1     # true fold-to-bet counters
+                    if a.action == Action.CHECK_CALL:
+                        o["call2"] = o.get("call2", 0) + 1
+                    if P["ftb_fix"] > 0:
+                        o["faced_bet"] += 1
             prior = False
             for h in hist[:idx]:
                 if h.street == a.street and h.action in (Action.RAISE_HALF, Action.RAISE_POT):
@@ -673,10 +681,11 @@ def _postflop(obs: Observation, memory: dict) -> Action:
         if e >= P["val_half"] + shift and can_raise:
             return Action.RAISE_HALF
         # bluff / semi-bluff against opponents who fold too much
-        if can_raise and street < 3 and st["fold_to_bet"] > 0.45 and e >= P["sb_e"]:
+        gate = st["ftb2"] >= P["bluff_gate"] and st["call2"] <= P["call_gate"]
+        if gate and can_raise and street < 3 and st["fold_to_bet"] > 0.45 and e >= P["sb_e"]:
             if random.random() < P["bluff_freq"] * (st["fold_to_bet"] - 0.35) * 2.5:
                 return Action.RAISE_POT if P["sb_pot"] > 0 else Action.RAISE_HALF
-        if can_raise and street == 3 and st["fold_to_bet"] > 0.55 and e < P["rb_e"]:
+        if gate and can_raise and street == 3 and st["fold_to_bet"] > 0.55 and e < P["rb_e"]:
             if random.random() < P["bluff_freq"] * (st["fold_to_bet"] - 0.45) * P["rb_k"]:
                 return Action.RAISE_POT
         return Action.CHECK_CALL
@@ -788,6 +797,11 @@ def on_hand_end(result: HandResult, memory: dict) -> None:
             o["faced_bet"] += 1
             if not result.went_to_showdown and result.winner == "me":
                 o["fold_to_bet"] += 1
+                o["faced2"] = o.get("faced2", 0) + 1
+                o["fold2"] = o.get("fold2", 0) + 1
+            elif result.went_to_showdown:
+                o["faced2"] = o.get("faced2", 0) + 1
+                o["call2"] = o.get("call2", 0) + 1
         if result.went_to_showdown and result.opp_hole:
             line = memory.setdefault("line", {})
             if last and last[0] in (Action.RAISE_HALF, Action.RAISE_POT):
