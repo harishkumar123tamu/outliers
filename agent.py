@@ -77,8 +77,8 @@ P = {
     "budget": 0.0015,        # max seconds of simulation per decision
     "budget_min": 0.0002,
     # preflop equity thresholds (vs a random hand)
-    "pf_open_pot": 0.585,
-    "pf_open_half": 0.545,
+    "pf_open_pot": 0.56,
+    "pf_open_half": 0.47,
     "pf_limp": 0.47,
     "pf_3bet": 0.60,
     "pf_4bet": 0.635,
@@ -97,6 +97,8 @@ P = {
     "ref_n": 24,
     "learn_ref_n": 25,
     "use_np": 1.0,
+    "rr_on": 1.0,
+    "cm_rr": 0.0,
     "learn_ref_np": 200,
     "np_fixed": 0.00015,
     "np_min": 60,
@@ -359,8 +361,9 @@ _PRIOR = {
     "bet": [0.55, 0.6, 0.8, 1.0, 1.2],
     "call": [0.7, 0.85, 1.0, 1.05, 1.1],
     "check": [1.2, 1.15, 1.0, 0.85, 0.7],
+    "raise": [0.3, 0.4, 0.6, 1.0, 1.7],
 }
-_TYPES = {2: "bet", 1: "call", 0: "check"}
+_TYPES = {3: "raise", 2: "bet", 1: "call", 0: "check"}
 
 
 def _opp(memory):
@@ -407,11 +410,17 @@ def _track_actions(obs: Observation, memory: dict):
         memory["hole"] = tuple(obs.hole_cards)
     line = memory["line"]
     hist = obs.action_history
-    for a in hist[memory["seen"]:]:
+    for idx in range(memory["seen"], len(hist)):
+        a = hist[idx]
         if a.is_me:
             continue
         raised = a.action in (Action.RAISE_HALF, Action.RAISE_POT)
         lv = 2 if raised else (1 if (a.action == Action.CHECK_CALL and a.amount > 0) else 0)
+        if raised and a.street != Street.PREFLOP and P["rr_on"] > 0:
+            for h in hist[:idx]:
+                if h.street == a.street and h.action in (Action.RAISE_HALF, Action.RAISE_POT):
+                    lv = 3      # a raise over a bet: much stronger range than a bet
+                    break
         st = int(a.street)
         if a.action != Action.FOLD:
             line[st] = max(line.get(st, 0), lv)
@@ -652,7 +661,7 @@ def _postflop(obs: Observation, memory: dict) -> Action:
     pot_odds = to_call / (obs.pot + to_call)
     if e >= P["raise_vs_bet"] and can_raise and obs.raises_this_street < 3:
         return Action.RAISE_POT
-    margin = P["cm%d" % street]
+    margin = P["cm%d" % street] + P["cm_rr"] * max(0, obs.raises_this_street - 1)
     if e >= pot_odds + margin:
         return Action.CHECK_CALL
     return Action.FOLD
