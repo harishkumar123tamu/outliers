@@ -96,6 +96,11 @@ P = {
     "prev_exp": 0.3,         # evidence from earlier streets counts less
     "ref_n": 24,
     "learn_ref_n": 25,
+    "use_np": 1.0,
+    "learn_ref_np": 200,
+    "np_fixed": 0.00015,
+    "np_min": 60,
+    "np_max": 3000,
     "bluff_freq": 0.30,
 }
 
@@ -151,28 +156,197 @@ _NB = 5       # postflop strength bins (quintiles vs random hands on this board)
 _FD_SCORE = 2 << _SHIFT   # a flush draw counts like a weak two pair
 
 
-def _build_pf_bins():
-    if not _PREFLOP:
-        return {}
+try:
+    import numpy as _np
+except Exception:          # numpy missing: fall back to the pure-Python simulator
+    _np = None
+
+_BINOM = [[0] * 37 for _ in range(6)]
+for _i in range(6):
+    for _c in range(37):
+        if _i == 0:
+            _BINOM[_i][_c] = 1
+        elif _c >= _i:
+            from math import comb as _mc
+            _BINOM[_i][_c] = _mc(_c, _i)
+
+
+def _colex(cards):
+    c = sorted(cards)
+    return _BINOM[1][c[0]] + _BINOM[2][c[1]] + _BINOM[3][c[2]] + _BINOM[4][c[3]] + _BINOM[5][c[4]]
+
+
+def _build_tables():
+    """Preflop decile of every 5-card hand (by colex index) and, with numpy,
+    rank-key score tables for fast vectorised Omaha evaluation."""
     from bisect import bisect_right
-    by_key = {}
-    eq = {}
-    for c in _comb(range(36), 5):
-        k = preflop_key(c)
-        e = _PREFLOP.get(k, 0.5)
-        eq[(1 << c[0]) | (1 << c[1]) | (1 << c[2]) | (1 << c[3]) | (1 << c[4])] = e
-    vals = sorted(eq.values())
-    n = len(vals)
-    cuts = [vals[n * k // _NB_PF] for k in range(1, _NB_PF)]
-    for e in set(vals):
-        by_key[e] = bisect_right(cuts, e)
-    return {m: by_key[e] for m, e in eq.items()}
+    combos = list(_comb(range(36), 5))
+    eqs = []
+    if _PREFLOP:
+        cache = {}
+        for c in combos:
+            k = preflop_key(c)
+            e = cache.get(k)
+            if e is None:
+                e = cache[k] = _PREFLOP.get(k, 0.5)
+            eqs.append(e)
+        vals = sorted(eqs)
+        n = len(vals)
+        cuts = [vals[n * k // _NB_PF] for k in range(1, _NB_PF)]
+        bmap = {e: bisect_right(cuts, e) for e in set(vals)}
+        bins = [bmap[e] for e in eqs]
+    else:
+        bins = None
+    pfbin = None
+    nf = fl = None
+    if _np is not None:
+        arr = _np.array(combos, dtype=_np.int64)
+        bt = _np.array(_BINOM, dtype=_np.int64)
+        idx = bt[1][arr[:, 0]] + bt[2][arr[:, 1]] + bt[3][arr[:, 2]] + bt[4][arr[:, 3]] + bt[5][arr[:, 4]]
+        if bins is not None:
+            pfbin = _np.zeros(len(combos), dtype=_np.int8)
+            pfbin[idx] = _np.array(bins, dtype=_np.int8)
+        masks = (_np.int64(1) << arr).sum(axis=1)
+        scores = _np.array([_TABLE[m] for m in masks.tolist()], dtype=_np.int32)
+        r5 = _np.array([5 ** (c >> 2) for c in range(36)], dtype=_np.int64)
+        keys = r5[arr].sum(axis=1)
+        su = arr & 3
+        flush = (su == su[:, :1]).all(axis=1)
+        size = 5 * 5 ** 8 + 1
+        nf = _np.zeros(size, dtype=_np.int32)
+        fl = _np.zeros(size, dtype=_np.int32)
+        nf[keys[~flush]] = scores[~flush]
+        fl[keys[flush]] = scores[flush]
+        pfd = None
+    else:
+        pfd = None
+        if bins is not None:
+            pfd = {}
+            for c, b in zip(combos, bins):
+                pfd[_colex(c)] = b
+    return pfbin, pfd, nf, fl
 
 
 try:
-    _PF_BIN = _build_pf_bins()
+    _PF_ARR, _PF_DICT, _NF, _FL = _build_tables()
 except Exception:
-    _PF_BIN = {}
+    _PF_ARR = _PF_DICT = _NF = _FL = None
+    _np = None
+_PF_OK = _PF_ARR is not None or bool(_PF_DICT)
+
+
+def _pf_bin(cards):
+    i = _colex(cards)
+    if _PF_ARR is not None:
+        return int(_PF_ARR[i])
+    if _PF_DICT:
+        return _PF_DICT.get(i)
+    return None
+
+
+if _np is not None:
+    _R5 = _np.array([5 ** (c >> 2) for c in range(36)], dtype=_np.int32)
+    _SU = _np.array([c & 3 for c in range(36)], dtype=_np.int8)
+    _PI = _np.array([p[0] for p in _PAIRS]); _PJ = _np.array([p[1] for p in _PAIRS])
+    _BT = _np.array(_BINOM, dtype=_np.int64)
+    _RNG = _np.random.default_rng()
+    _TRI_NP = {n: tuple(_np.array([t[k] for t in _TRIPLES_BY_LEN[n]]) for k in range(3)) for n in (3, 4, 5)}
+
+
+def _np_pairs(h):
+    """(..., 5) hole cards -> rank keys and suits (-1 = mixed) of the 10 two-card subsets."""
+    a, b = h[..., _PI], h[..., _PJ]
+    sa, sb = _SU[a], _SU[b]
+    return _R5[a] + _R5[b], _np.where(sa == sb, sa, -1)
+
+
+def _np_triples(bd):
+    """(..., n) board -> rank keys and suits (-2 = mixed) of its three-card subsets."""
+    ti, tj, tk = _TRI_NP[bd.shape[-1]]
+    a, b, c = bd[..., ti], bd[..., tj], bd[..., tk]
+    sa, sb, sc = _SU[a], _SU[b], _SU[c]
+    return _R5[a] + _R5[b] + _R5[c], _np.where((sa == sb) & (sb == sc), sa, -2)
+
+
+def _np_best(pk, ps, tk, ts):
+    key = pk[..., :, None] + tk[..., None, :]
+    sc = _np.where(ps[..., :, None] == ts[..., None, :], _FL[key], _NF[key])
+    return sc.reshape(sc.shape[:-2] + (-1,)).max(-1)
+
+
+def _np_strength(pk, ps, hole, board):
+    """Opponent strength on a partial or full board (vectorised _strength)."""
+    b = _np.array(board, dtype=_np.int64)
+    tk, ts = _np_triples(b)
+    s = _np_best(pk, ps, tk, ts)
+    fds = _flush_draw_suits(board)
+    if fds:
+        hs = _SU[hole]
+        has = _np.zeros(s.shape, dtype=bool)
+        for su in fds:
+            has |= (hs == su).sum(axis=-1) >= 2
+        s = _np.where(has & (s < _FD_SCORE), _FD_SCORE, s)
+    return s
+
+
+def _np_pct_bins(s):
+    srt = _np.sort(s)
+    n = len(s)
+    p = (_np.searchsorted(srt, s, "left") + _np.searchsorted(srt, s, "right")) / (2.0 * n)
+    return _np.minimum((p * _NB).astype(_np.int64), _NB - 1)
+
+
+def _np_pf_bins(hole):
+    h = _np.sort(hole, axis=1)
+    idx = _BT[1][h[:, 0]] + _BT[2][h[:, 1]] + _BT[3][h[:, 2]] + _BT[4][h[:, 3]] + _BT[5][h[:, 4]]
+    return _PF_ARR[idx]
+
+
+def _np_sample(rest, n, k):
+    r = _np.array(rest, dtype=_np.int64)
+    idx = _RNG.random((n, len(r))).argpartition(k, axis=1)[:, :k]
+    return r[idx]
+
+
+def equity_np(obs, memory, budget):
+    hole = list(obs.hole_cards)
+    board = list(obs.board)
+    used = set(hole) | set(board)
+    rest = [c for c in _DECK if c not in used]
+    need = 5 - len(board)
+    per = memory.get("np_per", 2.5e-6)
+    n = int((budget - P["np_fixed"]) / per)
+    n = max(int(P["np_min"]), min(int(P["np_max"]), n))
+    t0 = time.perf_counter()
+    C = _np_sample(rest, n, 5 + need)
+    opp = C[:, :5]
+    if need:
+        full = _np.concatenate([_np.broadcast_to(_np.array(board, dtype=_np.int64), (n, len(board))), C[:, 5:]], axis=1)
+    else:
+        full = _np.array(board, dtype=_np.int64)
+    tk, ts = _np_triples(full)
+    pk, ps = _np_pairs(opp)
+    mk, ms = _np_pairs(_np.array(hole, dtype=_np.int64))
+    theirs = _np_best(pk, ps, tk, ts)
+    mine = _np_best(mk, ms, tk, ts)
+    res = (mine > theirs) + 0.5 * (mine == theirs)
+    w = None
+    if P["range_on"] > 0:
+        pf_t, post_t = _range_tables(obs, memory)
+        if pf_t is not None and _PF_ARR is not None:
+            w = _np.array(pf_t)[_np_pf_bins(opp)]
+        if post_t is not None:
+            s = theirs if need == 0 else _np_strength(pk, ps, opp, board)
+            pw = _np.array(post_t)[_np_pct_bins(s)]
+            w = pw if w is None else w * pw
+    if w is None:
+        e = float(res.mean())
+    else:
+        tot = float(w.sum())
+        e = float((w * res).sum() / tot) if tot > 0 else float(res.mean())
+    dt = time.perf_counter() - t0
+    memory["np_per"] = 0.9 * per + 0.1 * max(5e-7, (dt - P["np_fixed"]) / n)
+    return e
 
 
 # ---------- opponent model ----------
@@ -309,6 +483,8 @@ def _range_tables(obs: Observation, memory: dict):
 
 
 def equity_vs_range(obs: Observation, memory: dict, budget: float) -> float:
+    if _np is not None and P["use_np"] > 0:
+        return equity_np(obs, memory, budget)
     hole = obs.hole_cards
     board = list(obs.board)
     used = set(hole) | set(board)
@@ -319,12 +495,11 @@ def equity_vs_range(obs: Observation, memory: dict, budget: float) -> float:
         pf_t, post_t = _range_tables(obs, memory)
     else:
         pf_t = post_t = None
-    if not _PF_BIN:
+    if not _PF_OK:
         pf_t = None
     fds = _flush_draw_suits(board)
     rnd = random.random
     sample = random.sample
-    pfb = _PF_BIN
     deadline = time.perf_counter() + budget
     fixed_mine = _best(mine_m, board) if need == 0 else None
     min_n = 8 if budget <= 0 else (25 if budget >= 0.0006 else 14)
@@ -351,7 +526,7 @@ def equity_vs_range(obs: Observation, memory: dict, budget: float) -> float:
             if not force:
                 w = 1.0
                 if pf_t is not None:
-                    w = pf_t[pfb.get(om[0] | om[1] | om[9], 5)]
+                    w = pf_t[_pf_bin(cards[:5])]
                 w *= post_t[_pct_bin(ref, s, _NB)]
                 if w < 1.0 and rnd() > w:
                     continue
@@ -361,7 +536,7 @@ def equity_vs_range(obs: Observation, memory: dict, budget: float) -> float:
             s = None
             if not force:
                 if pf_t is not None:
-                    w = pf_t[pfb.get(om[0] | om[1] | om[9], 5)]
+                    w = pf_t[_pf_bin(cards[:5])]
                     if w < 1.0 and rnd() > w:
                         if tries & 31 == 0 and time.perf_counter() > hard:
                             force = True
@@ -527,8 +702,8 @@ def _learn_showdown(result: HandResult, memory: dict):
     opp = tuple(result.opp_hole)
     om = _hole_masks(opp)
     lv = line.get(0)
-    if lv in (1, 2) and _PF_BIN:
-        b = _PF_BIN.get(om[0] | om[1] | om[9])
+    if lv in (1, 2) and _PF_OK:
+        b = _pf_bin(opp)
         if b is not None:
             hists["pfr" if lv == 2 else "pfc"][b] += 1
     full = list(result.board)
@@ -539,6 +714,19 @@ def _learn_showdown(result: HandResult, memory: dict):
     sample = random.sample
     last = memory.get("last_mine")
     max_st = max(list(line.keys()) + [last[1] if last else 0])
+    if _np is not None and P["use_np"] > 0:
+        R = _np_sample(rest, int(P["learn_ref_np"]), 5)
+        rpk, rps = _np_pairs(R)
+        oh = _np.array(opp, dtype=_np.int64)
+        opk, ops = _np_pairs(oh)
+        for st in range(1, min(3, max_st) + 1):
+            board = full[:2 + st]
+            ref = _np.sort(_np_strength(rpk, rps, R, board))
+            s = _np_strength(opk, ops, oh, board)
+            p = (_np.searchsorted(ref, s, "left") + _np.searchsorted(ref, s, "right")) / (2.0 * len(ref))
+            b = min(int(p * _NB), _NB - 1)
+            hists[_TYPES[line.get(st, 0)]][b] += 1
+        return
     for st in range(1, min(3, max_st) + 1):
         board = full[:2 + st]
         fds = _flush_draw_suits(board)

@@ -1,2 +1,3 @@
 fastapi==0.156.1
 uvicorn==0.54.0
+numpy
