@@ -99,11 +99,20 @@ P = {
     "use_np": 1.0,
     "rr_on": 1.0,
     "cm_rr": 0.0,
+    "ftb_fix": 0.0,
+    "sb_e": 0.30,
+    "sb_pot": 0.0,
+    "rb_e": 0.25,
+    "rb_k": 4.0,
+    "trap_th": 0.55,
+    "trap_k": 0.0,
+    "bc_k": 0.0,
+    "cr_k": 0.0,
     "learn_ref_np": 200,
     "np_fixed": 0.00015,
     "np_min": 60,
     "np_max": 3000,
-    "bluff_freq": 0.30,
+    "bluff_freq": 1.0,
 }
 
 
@@ -380,6 +389,7 @@ def opp_stats(memory):
         "pf_raise": _rate(o["pf_raise"], o["pf_dec"], 0.35, 20),
         "agg": _rate(o["post_raise"], o["post_dec"], 0.35, 20),
         "fold_to_bet": _rate(o["fold_to_bet"], o["faced_bet"], 0.40, 15),
+        "bet_free": _rate(o.get("free_bet", 0), o.get("free_dec", 0), 0.40, 20),
     }
 
 
@@ -416,11 +426,21 @@ def _track_actions(obs: Observation, memory: dict):
             continue
         raised = a.action in (Action.RAISE_HALF, Action.RAISE_POT)
         lv = 2 if raised else (1 if (a.action == Action.CHECK_CALL and a.amount > 0) else 0)
-        if raised and a.street != Street.PREFLOP and P["rr_on"] > 0:
+        if a.street != Street.PREFLOP:
+            if P["ftb_fix"] > 0 and idx > 0:
+                pv = hist[idx - 1]
+                if pv.is_me and pv.street == a.street and pv.action in (Action.RAISE_HALF, Action.RAISE_POT):
+                    o["faced_bet"] += 1      # they called or raised our bet (a fold is counted at hand end)
+            prior = False
             for h in hist[:idx]:
                 if h.street == a.street and h.action in (Action.RAISE_HALF, Action.RAISE_POT):
-                    lv = 3      # a raise over a bet: much stronger range than a bet
+                    prior = True
                     break
+            if raised and prior and P["rr_on"] > 0:
+                lv = 3      # a raise over a bet: much stronger range than a bet
+            if not prior:
+                o["free_dec"] += 1
+                o["free_bet"] += raised
         st = int(a.street)
         if a.action != Action.FOLD:
             line[st] = max(line.get(st, 0), lv)
@@ -646,22 +666,29 @@ def _postflop(obs: Observation, memory: dict) -> Action:
     if to_call == 0:
         # value-bet thinner against opponents who rarely fold
         shift = (st["fold_to_bet"] - 0.4) * 0.15
+        if st["bet_free"] > P["trap_th"] and street < 3:
+            shift += P["trap_k"] * (st["bet_free"] - P["trap_th"])
         if e >= P["val_pot"] + shift and can_raise:
             return Action.RAISE_POT
         if e >= P["val_half"] + shift and can_raise:
             return Action.RAISE_HALF
         # bluff / semi-bluff against opponents who fold too much
-        if can_raise and street < 3 and st["fold_to_bet"] > 0.45 and e >= 0.30:
+        if can_raise and street < 3 and st["fold_to_bet"] > 0.45 and e >= P["sb_e"]:
             if random.random() < P["bluff_freq"] * (st["fold_to_bet"] - 0.35) * 2.5:
-                return Action.RAISE_HALF
-        if can_raise and street == 3 and st["fold_to_bet"] > 0.55 and e < 0.25:
-            if random.random() < P["bluff_freq"] * (st["fold_to_bet"] - 0.45) * 2.0:
+                return Action.RAISE_POT if P["sb_pot"] > 0 else Action.RAISE_HALF
+        if can_raise and street == 3 and st["fold_to_bet"] > 0.55 and e < P["rb_e"]:
+            if random.random() < P["bluff_freq"] * (st["fold_to_bet"] - 0.45) * P["rb_k"]:
                 return Action.RAISE_POT
         return Action.CHECK_CALL
     pot_odds = to_call / (obs.pot + to_call)
-    if e >= P["raise_vs_bet"] and can_raise and obs.raises_this_street < 3:
+    rvb = P["raise_vs_bet"]
+    if st["bet_free"] > P["trap_th"] and obs.raises_this_street <= 1:
+        rvb -= P["cr_k"] * (st["bet_free"] - P["trap_th"])
+    if e >= rvb and can_raise and obs.raises_this_street < 3:
         return Action.RAISE_POT
     margin = P["cm%d" % street] + P["cm_rr"] * max(0, obs.raises_this_street - 1)
+    if st["bet_free"] > P["trap_th"] and obs.raises_this_street <= 1:
+        margin -= P["bc_k"] * (st["bet_free"] - P["trap_th"])
     if e >= pot_odds + margin:
         return Action.CHECK_CALL
     return Action.FOLD
@@ -679,7 +706,7 @@ def new_half(config: AgentConfig, memory: dict) -> None:
         except Exception:
             pass
     memory["opp"] = {"pf_dec": 0, "pf_raise": 0, "post_dec": 0, "post_raise": 0,
-                     "faced_bet": 0, "fold_to_bet": 0, "sd_aggr": 0, "sd_weak_aggr": 0}
+                     "faced_bet": 0, "fold_to_bet": 0, "free_dec": 0, "free_bet": 0, "sd_aggr": 0, "sd_weak_aggr": 0}
     memory["cur_hand"] = None
     memory["hists"] = _new_hists()
 
